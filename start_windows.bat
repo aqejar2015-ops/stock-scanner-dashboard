@@ -4,8 +4,9 @@ if not exist .venv python -m venv .venv
 call .venv\Scripts\activate
 python -m pip install --upgrade pip
 pip install -r requirements.txt
-if not exist .env copy .env.example .env
+
 echo.
-echo افتح ملف .env وضع مفتاح Polygon ثم اضغط Enter.
-pause
+echo تم تشغيل النسخة الجديدة.
+echo ضع مفتاح Polygon داخل خانة API Key في لوحة التحكم.
+echo.
 streamlit run app.py
