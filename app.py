@@ -8,23 +8,28 @@ import streamlit as st
 from dotenv import load_dotenv
 from streamlit_autorefresh import st_autorefresh
 
-load_dotenv()
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
 
 API_KEY = os.getenv("POLYGON_API_KEY", "").strip()
-REFERENCE_SYMBOLS = ["GRML", "IMCC", "WHLR"]
-DEFAULT_UNIVERSE = "AAPL,MSFT,NVDA,AMD,TSLA,AMZN,META,GOOGL,NFLX,PLTR,SOFI,HOOD,SMCI,MARA,RIOT,COIN,AMC,GME,NIO,XPEV,LCID,RIVN,SPY,QQQ,IWM"
+DEFAULT_REFERENCES = "GRML,IMCC,WHLR"
+DEFAULT_UNIVERSE = "BENF,IPDN,VTGN,DCOY,CAPS,BFRG,ZONE,TLSI,WAFU,IONQ,EDVA,SOS,SQFT,NNVC,EDIT,QNT,RTB,PAAI,SRFM,INFQ,ACRS,QBTS,AGPU,HAO,MYSE,VGAS,ASTC"
 REFRESH_SECONDS = 120
 BAR_MINUTES = 2
 LOOKBACK_DAYS = 7
 PATTERN_LENGTH = 30
 
-st.set_page_config(page_title="US Stock Pattern Scanner", page_icon="📈", layout="wide")
-st.title("📈 US Stock Pattern Scanner")
-st.caption("تحليل حركة GRML و IMCC و WHLR ومقارنة نمطها مع أسهم أمريكية أخرى")
+st.set_page_config(page_title="US Stock Pre-Rise Scanner", page_icon="📈", layout="wide")
+st.title("📈 US Stock Pre-Rise Scanner")
+st.caption("يقارن نمط آخر 30 شمعة مع الأنماط التي سبقت ارتفاعات تاريخية في الأسهم المرجعية")
 
 
 def parse_symbols(text):
-    return list(dict.fromkeys(s.strip().upper() for s in text.replace("\n", ",").split(",") if s.strip()))
+    return list(dict.fromkeys(
+        s.strip().upper()
+        for s in text.replace("\n", ",").replace("،", ",").split(",")
+        if s.strip()
+    ))
 
 
 def date_range():
@@ -55,36 +60,122 @@ def clean_bars(results):
 @st.cache_data(ttl=100, show_spinner=False)
 def fetch_bars(symbol):
     if not API_KEY:
-        return pd.DataFrame()
+        return pd.DataFrame(), "لم تتم قراءة POLYGON_API_KEY من ملف .env"
     start, end = date_range()
     url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/{BAR_MINUTES}/minute/{start}/{end}"
     try:
-        response = requests.get(url, params={"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": API_KEY}, timeout=30)
+        response = requests.get(
+            url,
+            params={"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": API_KEY},
+            timeout=30,
+        )
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = {}
         if response.status_code != 200:
-            return pd.DataFrame()
-        return clean_bars(response.json().get("results", []))
-    except requests.RequestException:
-        return pd.DataFrame()
+            message = payload.get("error") or payload.get("message") or response.text[:300]
+            return pd.DataFrame(), f"{symbol}: HTTP {response.status_code} - {message}"
+        frame = clean_bars(payload.get("results", []))
+        if frame.empty:
+            return pd.DataFrame(), f"{symbol}: لا توجد شموع في الفترة المطلوبة"
+        return frame, ""
+    except requests.RequestException as error:
+        return pd.DataFrame(), f"{symbol}: خطأ اتصال - {error}"
 
 
 def download_data(symbols):
-    data = {}
+    data, errors = {}, []
     progress = st.progress(0)
     for i, symbol in enumerate(symbols):
-        frame = fetch_bars(symbol)
+        frame, error = fetch_bars(symbol)
         if not frame.empty:
             data[symbol] = frame
+        if error:
+            errors.append(error)
         progress.progress((i + 1) / len(symbols))
     progress.empty()
-    return data
+    return data, errors
 
 
-def pattern(df):
+def zscore(values):
+    values = np.asarray(values, dtype=float)
+    values = np.nan_to_num(values)
+    std = values.std()
+    return np.zeros(len(values)) if std == 0 else (values - values.mean()) / std
+
+
+def pattern_from_window(df):
     if len(df) < PATTERN_LENGTH + 1:
         return None
-    values = np.nan_to_num(df["Return"].tail(PATTERN_LENGTH).to_numpy(float))
-    std = values.std()
-    return np.zeros(PATTERN_LENGTH) if std == 0 else (values - values.mean()) / std
+    # استخدام العوائد اللوغاريتمية يعطي مقارنة أفضل بين الأسهم ذات الأسعار المختلفة.
+    returns = np.diff(np.log(df["Close"].tail(PATTERN_LENGTH + 1).to_numpy(float)))
+    return zscore(returns)
+
+
+def correlation(a, b):
+    if a is None or b is None or len(a) != len(b):
+        return np.nan
+    value = np.corrcoef(a, b)[0, 1]
+    return float(value) if not np.isnan(value) else np.nan
+
+
+def detect_pre_rise_patterns(df, min_rise_pct, forward_bars, max_patterns=20):
+    """يستخرج النوافذ التي سبقت ارتفاعاً تاريخياً واضحاً."""
+    patterns = []
+    if len(df) < PATTERN_LENGTH + forward_bars + 1:
+        return patterns
+
+    closes = df["Close"].to_numpy(float)
+    for end in range(PATTERN_LENGTH, len(df) - forward_bars):
+        start = end - PATTERN_LENGTH
+        before = closes[end]
+        future_high = np.max(closes[end + 1:end + forward_bars + 1])
+        rise_pct = (future_high / before - 1) * 100
+        current_return = (before / closes[start] - 1) * 100
+
+        # نريد نمطاً قبل الارتفاع، وليس جزءاً من الارتفاع بعد بدايته.
+        if rise_pct >= min_rise_pct and current_return < min_rise_pct * 0.75:
+            window = df.iloc[start:end + 1]
+            candidate = pattern_from_window(window)
+            if candidate is not None:
+                patterns.append({
+                    "pattern": candidate,
+                    "rise_pct": rise_pct,
+                    "time": df.index[end],
+                })
+
+    # نحتفظ بأقوى الأنماط، ونمنع تكرار نفس الموجة المتجاورة.
+    patterns.sort(key=lambda x: x["rise_pct"], reverse=True)
+    selected = []
+    for item in patterns:
+        if all(abs((item["time"] - old["time"]).total_seconds()) > 60 * BAR_MINUTES * 8 for old in selected):
+            selected.append(item)
+        if len(selected) >= max_patterns:
+            break
+    return selected
+
+
+def find_best_pre_rise_match(candidate_df, reference_data, min_rise_pct, forward_bars):
+    candidate = pattern_from_window(candidate_df)
+    if candidate is None:
+        return np.nan, np.nan, None, 0
+
+    matches = []
+    for symbol, df in reference_data.items():
+        for item in detect_pre_rise_patterns(df, min_rise_pct, forward_bars):
+            score = correlation(candidate, item["pattern"])
+            if not np.isnan(score):
+                matches.append((score, item["rise_pct"], symbol, item["time"]))
+
+    if not matches:
+        return np.nan, np.nan, None, 0
+
+    matches.sort(reverse=True)
+    best = matches[0]
+    # تحويل الارتباط إلى 0..100 لعرضه كمؤشر مفهوم.
+    confidence = max(0, min(100, (best[0] + 1) * 50))
+    return best[0], confidence, f"{best[2]} ({best[3].strftime('%Y-%m-%d %H:%M')})", len(matches)
 
 
 def stats(df):
@@ -101,58 +192,71 @@ def stats(df):
     }
 
 
-def similarity(candidate, references):
-    values = []
-    for reference in references:
-        if candidate is not None and reference is not None:
-            corr = np.corrcoef(candidate, reference)[0, 1]
-            if not np.isnan(corr):
-                values.append(corr)
-    return float(np.mean(values)) if values else np.nan
-
-
-def ranking(data, universe):
-    references = [pattern(data[s]) for s in REFERENCE_SYMBOLS if s in data]
+def rank_candidates(data, universe, references, min_rise_pct, forward_bars):
+    reference_data = {s: data[s] for s in references if s in data}
     rows = []
     for symbol in universe:
-        if symbol in REFERENCE_SYMBOLS or symbol not in data:
-            continue
-        candidate = pattern(data[symbol])
-        if candidate is None:
+        if symbol in references or symbol not in data:
             continue
         item = stats(data[symbol])
-        score = similarity(candidate, references)
-        if np.isnan(score):
+        corr, confidence, example, match_count = find_best_pre_rise_match(
+            data[symbol], reference_data, min_rise_pct, forward_bars
+        )
+        if np.isnan(corr):
             continue
-        score += min(max(item["volume_ratio"] - 1, -1), 1) * 0.05
-        rows.append({"الرمز": symbol, "النتيجة": score, "التشابه %": score * 100, "السعر": item["price"], "تغير الأسبوع %": item["week_return"], "تغير آخر 30 شمعة %": item["recent_return"], "التذبذب %": item["volatility"], "الحجم مقارنة بالمتوسط": item["volume_ratio"], "عدد الشموع": item["bars"]})
-    return pd.DataFrame(rows).sort_values("النتيجة", ascending=False).reset_index(drop=True) if rows else pd.DataFrame()
+        # النشاط عامل ثانوي فقط؛ التشابه مع ما قبل الارتفاع هو العامل الأساسي.
+        activity_bonus = min(max(item["volume_ratio"] - 1, -1), 1) * 0.03
+        score = corr + activity_bonus
+        rows.append({
+            "الرمز": symbol,
+            "الثقة التقريبية %": confidence,
+            "التشابه": score,
+            "أقوى ارتفاع لاحق %": example,
+            "السعر": item["price"],
+            "تغير الأسبوع %": item["week_return"],
+            "تغير آخر 30 شمعة %": item["recent_return"],
+            "الحجم مقارنة بالمتوسط": item["volume_ratio"],
+            "عدد المطابقات": match_count,
+        })
+    return pd.DataFrame(rows).sort_values(["الثقة التقريبية %", "عدد المطابقات"], ascending=False).reset_index(drop=True) if rows else pd.DataFrame()
 
 
 if not API_KEY:
-    st.error("ضع مفتاح Polygon في ملف .env باسم POLYGON_API_KEY ثم أعد تشغيل البرنامج.")
+    st.error("لم يتم العثور على المفتاح. يجب أن يكون الملف .env بجوار app.py وبداخله POLYGON_API_KEY=مفتاحك")
     st.stop()
 
 with st.sidebar:
     st.header("⚙️ الإعدادات")
+    reference_text = st.text_input("الأسهم الأساسية الثلاثة", DEFAULT_REFERENCES)
+    references = parse_symbols(reference_text)
+    if len(references) != 3:
+        st.warning("اكتب ثلاثة رموز بالضبط، مفصولة بفاصلة.")
     universe_text = st.text_area("الأسهم المراد فحصها", DEFAULT_UNIVERSE, height=220)
     top_n = st.slider("عدد النتائج", 3, 10, 3)
-    st.info(f"شموع: {BAR_MINUTES} دقيقة | الفترة: {LOOKBACK_DAYS} أيام | التحديث: كل دقيقتين")
+    min_rise_pct = st.slider("الارتفاع التاريخي المطلوب بعد النمط %", 3.0, 30.0, 8.0, 0.5)
+    forward_bars = st.slider("عدد شموع قياس الارتفاع", 3, 30, 10)
+    st.info("يقارن آخر 30 شمعة للمرشح مع نوافذ سبقت ارتفاعاً في الأسهم الأساسية.")
 
 st_autorefresh(interval=REFRESH_SECONDS * 1000, key="refresh")
 universe = parse_symbols(universe_text)
-symbols = list(dict.fromkeys(REFERENCE_SYMBOLS + universe))
+if len(references) != 3:
+    st.stop()
 
-with st.spinner("جاري جلب البيانات وتحليلها..."):
-    data = download_data(symbols)
+symbols = list(dict.fromkeys(references + universe))
+with st.spinner("جاري جلب البيانات واكتشاف أنماط ما قبل الارتفاع..."):
+    data, errors = download_data(symbols)
+
+if errors:
+    with st.expander("تفاصيل جلب البيانات"):
+        st.write("\n".join(errors[:20]))
 
 if not data:
-    st.error("لم تصل بيانات. تحقق من المفتاح والاشتراك واتصال الإنترنت.")
+    st.error("لم تصل أي بيانات. تحقق من المفتاح والاشتراك واتصال الإنترنت.")
     st.stop()
 
 st.caption("آخر تحديث: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 cols = st.columns(3)
-for col, symbol in zip(cols, REFERENCE_SYMBOLS):
+for col, symbol in zip(cols, references):
     with col:
         st.subheader(symbol)
         if symbol not in data:
@@ -160,20 +264,24 @@ for col, symbol in zip(cols, REFERENCE_SYMBOLS):
             continue
         item = stats(data[symbol])
         st.metric("السعر", f"${item['price']:.4f}")
-        st.metric("تغير الأسبوع", f"{item['week_return']:.2f}%")
-        st.caption(f"الحجم الحالي: {item['volume_ratio']:.2f}x المتوسط")
+        st.metric("تغير الفترة", f"{item['week_return']:.2f}%")
+        events = detect_pre_rise_patterns(data[symbol], min_rise_pct, forward_bars)
+        st.caption(f"أنماط ما قبل الارتفاع المكتشفة: {len(events)}")
 
 st.divider()
-st.header("🏆 أفضل الأسهم المشابهة")
-result = ranking(data, universe)
+st.header("🏆 الأسهم التي تشبه نمط ما قبل الارتفاع")
+result = rank_candidates(data, universe, references, min_rise_pct, forward_bars)
 if result.empty:
-    st.warning("لا توجد نتائج كافية. أضف أسهماً أخرى أو تحقق من توفر البيانات.")
+    st.warning("لم نجد نمطاً مطابقاً. خفّض حد الارتفاع أو زِد فترة البيانات/عدد الأسهم.")
 else:
     top = result.head(top_n)
     st.success("المرشحون الحاليون: " + ", ".join(top["الرمز"].tolist()))
-    st.dataframe(top.style.format({"النتيجة": "{:.3f}", "التشابه %": "{:.2f}%", "السعر": "${:.4f}", "تغير الأسبوع %": "{:.2f}%", "تغير آخر 30 شمعة %": "{:.2f}%", "التذبذب %": "{:.2f}%", "الحجم مقارنة بالمتوسط": "{:.2f}x"}), use_container_width=True, hide_index=True)
+    st.dataframe(top.style.format({
+        "الثقة التقريبية %": "{:.1f}%", "التشابه": "{:.3f}", "السعر": "${:.4f}",
+        "تغير الأسبوع %": "{:.2f}%", "تغير آخر 30 شمعة %": "{:.2f}%",
+        "الحجم مقارنة بالمتوسط": "{:.2f}x",
+    }), use_container_width=True, hide_index=True)
     selected = st.selectbox("اختر سهماً للرسم", top["الرمز"].tolist())
-    chart = data[selected][["Close"]].rename(columns={"Close": "السعر"})
-    st.line_chart(chart, use_container_width=True)
+    st.line_chart(data[selected][["Close"]].rename(columns={"Close": "السعر"}), use_container_width=True)
 
-st.warning("هذه أداة تحليل وليست توصية مالية. التشابه التاريخي لا يضمن الحركة المستقبلية.")
+st.warning("هذا مؤشر تشابه تاريخي وليس ضماناً لارتفاع السهم أو توصية مالية. لا يمكن لأي كود معرفة الارتفاع القادم بدقة مؤكدة.")
