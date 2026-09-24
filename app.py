@@ -1,5 +1,6 @@
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -8,243 +9,154 @@ import streamlit as st
 from dotenv import load_dotenv
 from streamlit_autorefresh import st_autorefresh
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-load_dotenv(os.path.join(BASE_DIR, ".env"))
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
 
-ENV_API_KEY = os.getenv("POLYGON_API_KEY", "").strip()
-DEFAULT_REFERENCES = "GRML,IMCC,WHLR"
-DEFAULT_UNIVERSE = "BENF,IPDN,VTGN,DCOY,CAPS,BFRG,ZONE,TLSI,WAFU,IONQ,EDVA,SOS,SQFT,NNVC,EDIT,QNT,RTB,PAAI,SRFM,INFQ,ACRS,QBTS,AGPU,HAO,MYSE,VGAS,ASTC"
-REFRESH_SECONDS = 120
-BAR_MINUTES = 2
-LOOKBACK_DAYS = 7
-PATTERN_LENGTH = 30
+API_KEY = os.getenv("ALPACA_API_KEY", "").strip()
+SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "").strip()
+FEED = os.getenv("ALPACA_FEED", "iex").strip() or "iex"
+REFRESH_SECONDS = int(os.getenv("REFRESH_SECONDS", "120"))
+MIN_PRICE = float(os.getenv("MIN_PRICE", "1"))
+MIN_DOLLAR_VOLUME = float(os.getenv("MIN_DOLLAR_VOLUME", "100000"))
+MAX_SPREAD_PERCENT = float(os.getenv("MAX_SPREAD_PERCENT", "1.5"))
+DATA_URL = "https://data.alpaca.markets"
 
-st.set_page_config(page_title="US Stock Pre-Rise Scanner", page_icon="📈", layout="wide")
-st.title("📈 US Stock Pre-Rise Scanner")
-st.caption("يقارن نمط آخر 30 شمعة مع الأنماط التي سبقت ارتفاعات تاريخية في الأسهم المرجعية")
-
-
-def parse_symbols(text):
-    return list(dict.fromkeys(s.strip().upper() for s in text.replace("\n", ",").replace("،", ",").split(",") if s.strip()))
+st.set_page_config(page_title="NASDAQ Liquidity Scanner", page_icon="📈", layout="wide")
+st.markdown("<style>html,body,[class*=css]{direction:rtl;text-align:right}.card{background:#101827;border:1px solid #263449;border-radius:12px;padding:12px}</style>", unsafe_allow_html=True)
 
 
-def date_range():
-    end = datetime.now()
-    return (end - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+def symbols_from_text(text):
+    return list(dict.fromkeys(x.strip().upper() for x in text.replace(",", "\n").replace("،", "\n").splitlines() if x.strip()))[:100]
 
 
-def clean_bars(results):
-    rows = []
-    for item in results or []:
-        if all(k in item for k in ("o", "h", "l", "c", "v", "t")):
-            rows.append({
-                "Timestamp": pd.to_datetime(item["t"], unit="ms", utc=True).tz_convert("America/New_York"),
-                "Open": float(item["o"]), "High": float(item["h"]),
-                "Low": float(item["l"]), "Close": float(item["c"]), "Volume": float(item["v"]),
-            })
-    if not rows:
-        return pd.DataFrame()
-    df = pd.DataFrame(rows).set_index("Timestamp").sort_index()
-    df = df[(df.index.time >= pd.Timestamp("09:30").time()) & (df.index.time <= pd.Timestamp("16:00").time())]
-    if df.empty:
-        return df
-    df["Return"] = df["Close"].pct_change()
-    df["Range"] = (df["High"] - df["Low"]) / df["Close"]
-    return df.replace([np.inf, -np.inf], np.nan).dropna()
+def load_symbols():
+    path = BASE_DIR / "symbols.txt"
+    return symbols_from_text(path.read_text(encoding="utf-8")) if path.exists() else []
 
 
-@st.cache_data(ttl=100, show_spinner=False)
-def fetch_bars(symbol, api_key):
-    start, end = date_range()
-    url = f"https://api.polygon.io/v2/aggs/ticker/{symbol}/range/{BAR_MINUTES}/minute/{start}/{end}"
-    try:
-        response = requests.get(
-            url,
-            params={"adjusted": "true", "sort": "asc", "limit": 50000, "apiKey": api_key},
-            timeout=30,
-        )
-        try:
-            payload = response.json()
-        except ValueError:
-            payload = {}
-        if response.status_code != 200:
-            message = payload.get("error") or payload.get("message") or response.text[:300]
-            return pd.DataFrame(), f"{symbol}: HTTP {response.status_code} - {message}"
-        frame = clean_bars(payload.get("results", []))
-        if frame.empty:
-            return pd.DataFrame(), f"{symbol}: لا توجد شموع في الفترة المطلوبة"
-        return frame, ""
-    except requests.RequestException as error:
-        return pd.DataFrame(), f"{symbol}: خطأ اتصال - {error}"
+def api_get(path, params):
+    r = requests.get(DATA_URL + path, headers={"APCA-API-KEY-ID": API_KEY, "APCA-API-SECRET-KEY": SECRET_KEY}, params=params, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"Alpaca API {r.status_code}: {r.text[:300]}")
+    return r.json()
 
 
-def download_data(symbols, api_key):
-    data, errors = {}, []
-    progress = st.progress(0)
-    for i, symbol in enumerate(symbols):
-        frame, error = fetch_bars(symbol, api_key)
-        if not frame.empty:
-            data[symbol] = frame
-        if error:
-            errors.append(error)
-        progress.progress((i + 1) / len(symbols))
-    progress.empty()
-    return data, errors
+def indicators(df):
+    df = df.copy()
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["close", "volume"])
+    typical = (df.high + df.low + df.close) / 3
+    df["vwap_calc"] = (typical * df.volume).cumsum() / df.volume.replace(0, np.nan).cumsum()
+    df["ema9"] = df.close.ewm(span=9, adjust=False).mean()
+    df["ema20"] = df.close.ewm(span=20, adjust=False).mean()
+    delta = df.close.diff()
+    gain = delta.clip(lower=0).rolling(14).mean()
+    loss = -delta.clip(upper=0).rolling(14).mean()
+    df["rsi"] = (100 - 100 / (1 + gain / loss.replace(0, np.nan))).fillna(50)
+    df["avg_volume"] = df.volume.rolling(20, min_periods=3).mean()
+    df["rvol"] = (df.volume / df.avg_volume.replace(0, np.nan)).replace([np.inf, -np.inf], np.nan).fillna(0)
+    df["dollar_volume"] = df.close * df.volume
+    return df.dropna(subset=["close"])
 
 
-def zscore(values):
-    values = np.nan_to_num(np.asarray(values, dtype=float))
-    std = values.std()
-    return np.zeros(len(values)) if std == 0 else (values - values.mean()) / std
+def fetch_bars(symbols):
+    now = datetime.now(timezone.utc)
+    payload = api_get("/v2/stocks/bars", {"symbols": ",".join(symbols), "timeframe": "2Min", "start": (now - timedelta(hours=18)).isoformat(), "end": now.isoformat(), "feed": FEED, "adjustment": "raw", "limit": 10000, "sort": "asc"})
+    out = {}
+    for symbol, rows in payload.get("bars", {}).items():
+        if len(rows) < 2:
+            continue
+        df = pd.DataFrame(rows).rename(columns={"t":"timestamp","o":"open","h":"high","l":"low","c":"close","v":"volume"})
+        needed = ["timestamp", "open", "high", "low", "close", "volume"]
+        if all(x in df for x in needed):
+            out[symbol] = indicators(df)
+    return out
 
 
-def pattern_from_window(df):
-    if len(df) < PATTERN_LENGTH + 1:
+def fetch_quotes(symbols):
+    payload = api_get("/v2/stocks/quotes/latest", {"symbols": ",".join(symbols), "feed": FEED})
+    out = {}
+    for symbol, q in payload.get("quotes", {}).items():
+        bid, ask = float(q.get("bp") or 0), float(q.get("ap") or 0)
+        out[symbol] = {"spread": ((ask - bid) / ((ask + bid) / 2) * 100) if bid and ask else np.nan}
+    return out
+
+
+def score(symbol, df, quote):
+    if len(df) < 2:
         return None
-    returns = np.diff(np.log(df["Close"].tail(PATTERN_LENGTH + 1).to_numpy(float)))
-    return zscore(returns)
+    prev, cur = df.iloc[-2], df.iloc[-1]
+    price = float(cur.close)
+    price_change = (price / float(prev.close) - 1) * 100 if prev.close else 0
+    volume_growth = (float(cur.volume) / float(prev.volume) - 1) * 100 if prev.volume else 0
+    rvol, vwap, rsi = float(cur.rvol), float(cur.vwap_calc), float(cur.rsi)
+    spread = float(quote.get("spread", np.nan))
+    result = 0.0
+    reasons = []
+    if price_change > 0: result += min(25, price_change * 8); reasons.append("السعر يرتفع")
+    else: result += max(-15, price_change * 4)
+    if volume_growth > 0: result += min(25, volume_growth / 4); reasons.append("الحجم يتزايد")
+    else: result += max(-10, volume_growth / 8)
+    if rvol >= 1.5: result += 15; reasons.append("RVOL مرتفع")
+    elif rvol >= 1: result += 7
+    if price > vwap: result += 10; reasons.append("فوق VWAP")
+    if price > cur.ema9 > cur.ema20: result += 10; reasons.append("اتجاه EMA إيجابي")
+    if 50 <= rsi <= 75: result += 8; reasons.append("RSI صحي")
+    elif rsi > 85: result -= 8; reasons.append("تشبع محتمل")
+    if np.isnan(spread) or spread <= MAX_SPREAD_PERCENT: result += 7
+    else: result -= 15; reasons.append("سبريد مرتفع")
+    if price_change <= 0 and volume_growth > 20: result -= 20; reasons.append("ضغط بيع محتمل")
+    status = "إيجابي" if result >= 55 else "مراقبة" if result >= 35 else "ضعيف"
+    return {"الرمز":symbol,"السعر":price,"تغير_دقيقتين":price_change,"قيمة_التداول":float(cur.dollar_volume),"نمو_الحجم":volume_growth,"RVOL":rvol,"VWAP":vwap,"RSI":rsi,"السبريد":spread,"الدرجة":max(0,min(100,result)),"الحالة":status,"السبب":"، ".join(reasons)}
 
 
-def correlation(a, b):
-    if a is None or b is None or len(a) != len(b):
-        return np.nan
-    value = np.corrcoef(a, b)[0, 1]
-    return float(value) if not np.isnan(value) else np.nan
+def scan(symbols):
+    bars, quotes = fetch_bars(symbols), fetch_quotes(symbols)
+    rows = [score(s, df, quotes.get(s, {})) for s, df in bars.items()]
+    rows = [x for x in rows if x and x["السعر"] >= MIN_PRICE and x["قيمة_التداول"] >= MIN_DOLLAR_VOLUME]
+    return pd.DataFrame(rows).sort_values(["الدرجة", "قيمة_التداول"], ascending=False).reset_index(drop=True) if rows else pd.DataFrame()
 
 
-def detect_pre_rise_patterns(df, min_rise_pct, forward_bars, max_patterns=20):
-    patterns = []
-    if len(df) < PATTERN_LENGTH + forward_bars + 1:
-        return patterns
-    closes = df["Close"].to_numpy(float)
-    for end in range(PATTERN_LENGTH, len(df) - forward_bars):
-        start = end - PATTERN_LENGTH
-        before = closes[end]
-        future_high = np.max(closes[end + 1:end + forward_bars + 1])
-        rise_pct = (future_high / before - 1) * 100
-        current_return = (before / closes[start] - 1) * 100
-        if rise_pct >= min_rise_pct and current_return < min_rise_pct * 0.75:
-            candidate = pattern_from_window(df.iloc[start:end + 1])
-            if candidate is not None:
-                patterns.append({"pattern": candidate, "rise_pct": rise_pct, "time": df.index[end]})
-    patterns.sort(key=lambda x: x["rise_pct"], reverse=True)
-    selected = []
-    for item in patterns:
-        if all(abs((item["time"] - old["time"]).total_seconds()) > 60 * BAR_MINUTES * 8 for old in selected):
-            selected.append(item)
-        if len(selected) >= max_patterns:
-            break
-    return selected
-
-
-def find_best_pre_rise_match(candidate_df, reference_data, min_rise_pct, forward_bars):
-    candidate = pattern_from_window(candidate_df)
-    if candidate is None:
-        return np.nan, np.nan, None, 0
-    matches = []
-    for symbol, df in reference_data.items():
-        for item in detect_pre_rise_patterns(df, min_rise_pct, forward_bars):
-            score = correlation(candidate, item["pattern"])
-            if not np.isnan(score):
-                matches.append((score, item["rise_pct"], symbol, item["time"]))
-    if not matches:
-        return np.nan, np.nan, None, 0
-    matches.sort(reverse=True)
-    best = matches[0]
-    confidence = max(0, min(100, (best[0] + 1) * 50))
-    return best[0], confidence, f"{best[2]} ({best[3].strftime('%Y-%m-%d %H:%M')})", len(matches)
-
-
-def stats(df):
-    first, last = float(df.Close.iloc[0]), float(df.Close.iloc[-1])
-    recent = df.tail(PATTERN_LENGTH)
-    average_volume = df.Volume.tail(50).mean()
-    return {
-        "price": last,
-        "week_return": (last / first - 1) * 100,
-        "recent_return": (recent.Close.iloc[-1] / recent.Close.iloc[0] - 1) * 100 if len(recent) > 1 else 0,
-        "volume_ratio": float(df.Volume.iloc[-1] / average_volume) if average_volume else 0,
-    }
-
-
-def rank_candidates(data, universe, references, min_rise_pct, forward_bars):
-    reference_data = {s: data[s] for s in references if s in data}
-    rows = []
-    for symbol in universe:
-        if symbol in references or symbol not in data:
-            continue
-        item = stats(data[symbol])
-        corr, confidence, example, match_count = find_best_pre_rise_match(data[symbol], reference_data, min_rise_pct, forward_bars)
-        if np.isnan(corr):
-            continue
-        score = corr + min(max(item["volume_ratio"] - 1, -1), 1) * 0.03
-        rows.append({"الرمز": symbol, "الثقة التقريبية %": confidence, "التشابه": score, "النمط المشابه": example, "السعر": item["price"], "تغير الفترة %": item["week_return"], "تغير آخر 30 شمعة %": item["recent_return"], "الحجم مقارنة بالمتوسط": item["volume_ratio"], "عدد المطابقات": match_count})
-    return pd.DataFrame(rows).sort_values(["الثقة التقريبية %", "عدد المطابقات"], ascending=False).reset_index(drop=True) if rows else pd.DataFrame()
-
+st.title("📈 ماسح السيولة والإيجابية - NASDAQ")
+st.caption("مقارنة السعر والسيولة مع آخر شمعة مدتها دقيقتان. هذه أداة تحليل وليست توصية مالية.")
+if not API_KEY or not SECRET_KEY:
+    st.error("أضف ALPACA_API_KEY و ALPACA_SECRET_KEY في ملف .env ثم أعد التشغيل.")
+    st.stop()
 
 with st.sidebar:
-    st.header("⚙��� الإعدادات")
-    st.subheader("🔐 مفتاح Polygon/Massive")
-    st.caption("يمكنك لصق المفتاح هنا مباشرة. لا يتم حفظه في GitHub.")
-    api_key = st.text_input("API Key", value=ENV_API_KEY, type="password", help="الصق مفتاح Polygon/Massive هنا")
-    if api_key:
-        st.success("تم إدخال المفتاح")
-    else:
-        st.warning("أدخل المفتاح أولاً")
-    reference_text = st.text_input("الأسهم الأساسية الثلاثة", DEFAULT_REFERENCES)
-    references = parse_symbols(reference_text)
-    if len(references) != 3:
-        st.warning("اكتب ثلاثة رموز بالضبط، مفصولة بفاصلة.")
-    universe_text = st.text_area("الأسهم المراد فحصها", DEFAULT_UNIVERSE, height=220)
-    top_n = st.slider("عدد النتائج", 3, 10, 3)
-    min_rise_pct = st.slider("الارتفاع التاريخي المطلوب بعد النمط %", 3.0, 30.0, 8.0, 0.5)
-    forward_bars = st.slider("عدد شموع قياس الارتفاع", 3, 30, 10)
-    st.info("يقارن آخر 30 شمعة للمرشح مع نوافذ سبقت ارتفاعاً في الأسهم الأساسية.")
+    st.header("الإعدادات")
+    upload = st.file_uploader("ارفع ملف الأسهم TXT أو CSV", type=["txt", "csv"])
+    symbols = symbols_from_text(upload.read().decode("utf-8")) if upload else load_symbols()
+    st.write(f"عدد الأسهم: {len(symbols)} / 100")
+    st.write(f"مصدر البيانات: Alpaca {FEED.upper()}")
+    st.write(f"التحديث: كل {REFRESH_SECONDS} ثانية")
+    st.info("IEX المجاني لا يمثل كامل السوق الأمريكي وقد تختلف تغطيته عن Nasdaq SIP.")
 
-if not api_key:
-    st.error("الصق مفتاح Polygon/Massive في خانة API Key على اليسار.")
+if not symbols:
+    st.warning("أضف رموز الأسهم في symbols.txt.")
     st.stop()
 
-st_autorefresh(interval=REFRESH_SECONDS * 1000, key="refresh")
-universe = parse_symbols(universe_text)
-if len(references) != 3:
-    st.stop()
-
-symbols = list(dict.fromkeys(references + universe))
-with st.spinner("جاري جلب البيانات واكتشاف أنماط ما قبل الارتفاع..."):
-    data, errors = download_data(symbols, api_key)
-
-if errors:
-    with st.expander("تفاصيل جلب البيانات"):
-        st.write("\n".join(errors[:20]))
-
-if not data:
-    st.error("لم تصل أي بيانات. تحقق من المفتاح والخطة واتصال الإنترنت.")
+st_autorefresh(interval=REFRESH_SECONDS * 1000, key="market_refresh")
+try:
+    with st.spinner("جاري جلب البيانات وتحليل السيولة..."):
+        result = scan(symbols)
+except Exception as exc:
+    st.error(f"حدث خطأ: {exc}")
     st.stop()
 
 st.caption("آخر تحديث: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-cols = st.columns(3)
-for col, symbol in zip(cols, references):
-    with col:
-        st.subheader(symbol)
-        if symbol not in data:
-            st.warning("لا توجد بيانات")
-            continue
-        item = stats(data[symbol])
-        st.metric("السعر", f"${item['price']:.4f}")
-        st.metric("تغير الفترة", f"{item['week_return']:.2f}%")
-        st.caption(f"الحجم الحالي: {item['volume_ratio']:.2f}x المتوسط")
-
-st.divider()
-st.header("🏆 الأسهم التي تشبه نمط ما قبل الارتفاع")
-result = rank_candidates(data, universe, references, min_rise_pct, forward_bars)
 if result.empty:
-    st.warning("لم نجد نمطاً مطابقاً. خفّض حد الارتفاع أو زِد فترة البيانات/عدد الأسهم.")
-else:
-    top = result.head(top_n)
-    st.success("المرشحون الحاليون: " + ", ".join(top["الرمز"].tolist()))
-    st.dataframe(top.style.format({"الثقة التقريبية %": "{:.1f}%", "التشابه": "{:.3f}", "السعر": "${:.4f}", "تغير الفترة %": "{:.2f}%", "تغير آخر 30 شمعة %": "{:.2f}%", "الحجم مقارنة بالمتوسط": "{:.2f}x"}), use_container_width=True, hide_index=True)
-    selected = st.selectbox("اختر سهماً للرسم", top["الرمز"].tolist())
-    st.line_chart(data[selected][["Close"]].rename(columns={"Close": "السعر"}), use_container_width=True)
+    st.warning("لا توجد بيانات كافية. تحقق من المفاتيح والسوق والرموز.")
+    st.stop()
 
-st.warning("هذا مؤشر تشابه تاريخي وليس ضماناً لارتفاع السهم أو توصية مالية.")
+st.subheader("أفضل 5 أسهم")
+for col, (_, row) in zip(st.columns(5), result.head(5).iterrows()):
+    col.markdown(f"<div class='card'><h3>{row['الرمز']}</h3><b>{row['الحالة']}</b><br>الدرجة: {row['الدرجة']:.1f}<br>السعر: ${row['السعر']:.2f}<br>التغير: {row['تغير_دقيقتين']:+.2f}%<br>RVOL: {row['RVOL']:.2f}x<br>السيولة: ${row['قيمة_التداول']:,.0f}</div>", unsafe_allow_html=True)
+
+view = result.copy()
+for c in ["السعر", "VWAP", "RSI", "الدرجة", "RVOL", "تغير_دقيقتين", "نمو_الحجم"]:
+    view[c] = view[c].round(2)
+st.subheader("ترتيب جميع الأسهم")
+st.dataframe(view, use_container_width=True, hide_index=True)
+st.download_button("تحميل النتائج CSV", result.to_csv(index=False).encode("utf-8-sig"), "market_scan.csv", "text/csv")
